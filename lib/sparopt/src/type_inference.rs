@@ -47,7 +47,8 @@ pub fn infer_query_expression_types(
             output_types
         }
         #[cfg(feature = "sep-0006")]
-        QueryExpression::Lateral { left, right } => {
+        QueryExpression::Lateral { left, right }
+        | QueryExpression::AdaptiveLateral { left, right, .. } => {
             infer_query_expression_types(right, infer_query_expression_types(left, types))
         }
         QueryExpression::LeftJoin { left, right, .. } => {

@@ -109,6 +109,24 @@ impl Optimizer {
                 let right = Self::normalize_pattern(*right, &left_types);
                 QueryExpression::lateral(left, right)
             }
+            #[cfg(feature = "sep-0006")]
+            QueryExpression::AdaptiveLateral {
+                left,
+                right,
+                hash_right,
+                keys,
+                max_lateral_rows,
+            } => {
+                let left = Self::normalize_pattern(*left, input_types);
+                let left_types = infer_query_expression_types(&left, input_types.clone());
+                QueryExpression::adaptive_lateral(
+                    left,
+                    Self::normalize_pattern(*right, &left_types),
+                    Self::normalize_pattern(*hash_right, input_types),
+                    keys,
+                    max_lateral_rows,
+                )
+            }
             QueryExpression::Filter { inner, expression } => {
                 let inner = Self::normalize_pattern(*inner, input_types);
                 let inner_types = infer_query_expression_types(&inner, input_types.clone());
@@ -408,6 +426,56 @@ impl Optimizer {
                 } else {
                     QueryExpression::lateral(left, right)
                 }
+            }
+            #[cfg(feature = "sep-0006")]
+            QueryExpression::AdaptiveLateral {
+                left,
+                right,
+                hash_right,
+                keys,
+                max_lateral_rows,
+            } => {
+                let left_types = infer_query_expression_types(&left, input_types.clone());
+                let right_types = infer_query_expression_types(&right, input_types.clone());
+                let hash_right_types =
+                    infer_query_expression_types(&hash_right, input_types.clone());
+                let is_left_join = matches!(&*right, QueryExpression::LeftJoin { left, .. } if left.is_empty_singleton());
+                let mut left_filters = Vec::new();
+                let mut right_filters = Vec::new();
+                let mut final_filters = Vec::new();
+                for filter in filters {
+                    if can_filter_be_pushed(&filter, &left_types, &right_types) {
+                        left_filters.push(filter);
+                    } else if !is_left_join
+                        && can_filter_be_pushed(&filter, &hash_right_types, &left_types)
+                    {
+                        // The filter does not depend on the left side: it can be evaluated in both right sides
+                        right_filters.push(filter);
+                    } else {
+                        final_filters.push(filter);
+                    }
+                }
+                let left = Self::push_filters(*left, left_filters, input_types);
+                let mut right = Self::push_filters(*right, right_filters.clone(), &left_types);
+                if let QueryExpression::Filter {
+                    inner: inner_right,
+                    expression,
+                } = right
+                {
+                    // Like for lateral joins, we prefer to have filter out of the join rather than inside the right part
+                    final_filters.push(expression);
+                    right = *inner_right;
+                }
+                QueryExpression::filter(
+                    QueryExpression::adaptive_lateral(
+                        left,
+                        right,
+                        Self::push_filters(*hash_right, right_filters, input_types),
+                        keys,
+                        max_lateral_rows,
+                    ),
+                    Expression::and_all(final_filters),
+                )
             }
             QueryExpression::LeftJoin {
                 left,
@@ -744,6 +812,23 @@ impl Optimizer {
                 ),
                 current_graph,
             ),
+            #[cfg(feature = "sep-0006")]
+            QueryExpression::AdaptiveLateral {
+                left,
+                right,
+                hash_right,
+                keys,
+                max_lateral_rows,
+            } => wrap_in_possible_graph(
+                QueryExpression::adaptive_lateral(
+                    Self::push_graph(*left, None, input_types),
+                    Self::push_graph(*right, None, input_types),
+                    Self::push_graph(*hash_right, None, input_types),
+                    keys,
+                    max_lateral_rows,
+                ),
+                current_graph,
+            ),
             QueryExpression::Extend {
                 inner,
                 variable,
@@ -891,6 +976,24 @@ impl Optimizer {
                 let left = Self::flatten_joins(*left, input_types);
                 let left_types = infer_query_expression_types(&left, input_types.clone());
                 QueryExpression::lateral(left, Self::flatten_joins(*right, &left_types))
+            }
+            #[cfg(feature = "sep-0006")]
+            QueryExpression::AdaptiveLateral {
+                left,
+                right,
+                hash_right,
+                keys,
+                max_lateral_rows,
+            } => {
+                let left = Self::flatten_joins(*left, input_types);
+                let left_types = infer_query_expression_types(&left, input_types.clone());
+                QueryExpression::adaptive_lateral(
+                    left,
+                    Self::flatten_joins(*right, &left_types),
+                    Self::flatten_joins(*hash_right, input_types),
+                    keys,
+                    max_lateral_rows,
+                )
             }
             QueryExpression::Filter { inner, expression } => Self::filter_with_values(
                 Self::flatten_joins(*inner, input_types),
@@ -1149,6 +1252,35 @@ impl Optimizer {
                     Err(Box::new(QueryExpression::Lateral { left, right }))
                 }
             }
+            #[cfg(feature = "sep-0006")]
+            QueryExpression::AdaptiveLateral {
+                left,
+                right,
+                hash_right,
+                keys,
+                max_lateral_rows,
+            } => {
+                if !is_variable_used(&right, variable)
+                    && !is_variable_used(&hash_right, variable)
+                    && is_computable_from(&left)
+                {
+                    Ok(QueryExpression::adaptive_lateral(
+                        sink_or_extend(*left),
+                        *right,
+                        *hash_right,
+                        keys,
+                        max_lateral_rows,
+                    ))
+                } else {
+                    Err(Box::new(QueryExpression::AdaptiveLateral {
+                        left,
+                        right,
+                        hash_right,
+                        keys,
+                        max_lateral_rows,
+                    }))
+                }
+            }
             QueryExpression::Join {
                 left,
                 right,
@@ -1261,6 +1393,23 @@ impl JoinReorderer<'_> {
                 QueryExpression::lateral(
                     self.reorder_joins_with_filters(*left, input_types, filters),
                     self.reorder_joins(*right, &left_types),
+                )
+            }
+            #[cfg(feature = "sep-0006")]
+            QueryExpression::AdaptiveLateral {
+                left,
+                right,
+                hash_right,
+                keys,
+                max_lateral_rows,
+            } => {
+                let left_types = infer_query_expression_types(&left, input_types.clone());
+                QueryExpression::adaptive_lateral(
+                    self.reorder_joins_with_filters(*left, input_types, filters),
+                    self.reorder_joins(*right, &left_types),
+                    self.reorder_joins(*hash_right, input_types),
+                    keys,
+                    max_lateral_rows,
                 )
             }
             QueryExpression::LeftJoin {
@@ -1398,14 +1547,28 @@ impl JoinReorderer<'_> {
                     ) && for_loop_join_cost(left_estimate, for_loop_estimate)
                         <= hash_join_cost(left_estimate, hash_estimate)
                     {
-                        return QueryExpression::lateral(
+                        // We keep the hash join plan in case the estimates are wrong
+                        let keys = join_key_variables(
+                            &left_types,
+                            &infer_query_expression_types(&right, input_types.clone()),
+                            input_types,
+                        );
+                        return QueryExpression::adaptive_lateral(
                             left,
                             QueryExpression::left_join(
                                 QueryExpression::empty_singleton(),
                                 right_for_loop,
+                                expression.clone(),
+                                LeftJoinAlgorithm::HashBuildRightProbeLeft { keys: Vec::new() },
+                            ),
+                            QueryExpression::left_join(
+                                QueryExpression::empty_singleton(),
+                                without_adaptive_laterals(right),
                                 expression,
                                 LeftJoinAlgorithm::HashBuildRightProbeLeft { keys: Vec::new() },
                             ),
+                            keys,
+                            max_lateral_rows(left_estimate.cardinality),
                         );
                     }
                     return Self::hash_left_join(left, &left_types, right, expression, input_types);
@@ -1790,7 +1953,18 @@ impl JoinReorderer<'_> {
         for step in &order.steps {
             #[cfg(feature = "sep-0006")]
             if step.is_for_loop {
-                output = QueryExpression::lateral(output, step.plan.expression.clone());
+                // We keep the hash join plan in case the estimates are wrong
+                output = QueryExpression::adaptive_lateral(
+                    output,
+                    step.plan.expression.clone(),
+                    without_adaptive_laterals(
+                        self.plan_operand_alone(&operands[step.operand], input_types)
+                            .expression
+                            .clone(),
+                    ),
+                    join_key_variables(&output_types, &operands[step.operand].types, input_types),
+                    max_lateral_rows(step.left_cardinality),
+                );
                 output_types.intersect_with(operands[step.operand].types.clone());
                 continue;
             }
@@ -1992,6 +2166,107 @@ fn is_for_loop_join_useful(
     for_loop_right.cardinality < hash_right.cardinality || left.cardinality <= 1. || is_left_values
 }
 
+/// The number of left rows after which an adaptive lateral join switches to a hash join
+///
+/// It is quite bigger than the estimate to avoid switching when the estimate is just a bit off.
+#[cfg(feature = "sep-0006")]
+fn max_lateral_rows(left_cardinality_estimate: f64) -> u64 {
+    const MIN_MAX_LATERAL_ROWS: u64 = 10_000;
+    let max = (left_cardinality_estimate * 10.).ceil();
+    if max.is_finite() && max < 1e18 {
+        // We are in the bounds of u64
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let max = max as u64;
+        max.max(MIN_MAX_LATERAL_ROWS)
+    } else {
+        u64::MAX
+    }
+}
+
+/// Replaces the adaptive lateral joins by plain lateral joins
+///
+/// Used for the hash join alternative of adaptive lateral joins:
+/// keeping the nested alternatives would make the plan size exponential in the nesting depth.
+#[cfg(feature = "sep-0006")]
+fn without_adaptive_laterals(query_expression: QueryExpression) -> QueryExpression {
+    match query_expression {
+        QueryExpression::AdaptiveLateral { left, right, .. }
+        | QueryExpression::Lateral { left, right } => QueryExpression::lateral(
+            without_adaptive_laterals(*left),
+            without_adaptive_laterals(*right),
+        ),
+        QueryExpression::Join {
+            left,
+            right,
+            algorithm,
+        } => QueryExpression::join(
+            without_adaptive_laterals(*left),
+            without_adaptive_laterals(*right),
+            algorithm,
+        ),
+        QueryExpression::LeftJoin {
+            left,
+            right,
+            expression,
+            algorithm,
+        } => QueryExpression::left_join(
+            without_adaptive_laterals(*left),
+            without_adaptive_laterals(*right),
+            expression,
+            algorithm,
+        ),
+        QueryExpression::Minus {
+            left,
+            right,
+            algorithm,
+        } => QueryExpression::minus(
+            without_adaptive_laterals(*left),
+            without_adaptive_laterals(*right),
+            algorithm,
+        ),
+        QueryExpression::Filter { inner, expression } => {
+            QueryExpression::filter(without_adaptive_laterals(*inner), expression)
+        }
+        QueryExpression::Union { inner } => {
+            QueryExpression::union_all(inner.into_iter().map(without_adaptive_laterals))
+        }
+        QueryExpression::Extend {
+            inner,
+            variable,
+            expression,
+        } => QueryExpression::extend(without_adaptive_laterals(*inner), variable, expression),
+        QueryExpression::Graph { graph_name, inner } => {
+            QueryExpression::graph(without_adaptive_laterals(*inner), graph_name)
+        }
+        QueryExpression::OrderBy { inner, expression } => {
+            QueryExpression::order_by(without_adaptive_laterals(*inner), expression)
+        }
+        QueryExpression::Project { inner, variables } => {
+            QueryExpression::project(without_adaptive_laterals(*inner), variables)
+        }
+        QueryExpression::Distinct { inner } => {
+            QueryExpression::distinct(without_adaptive_laterals(*inner))
+        }
+        QueryExpression::Reduced { inner } => {
+            QueryExpression::reduced(without_adaptive_laterals(*inner))
+        }
+        QueryExpression::Slice {
+            inner,
+            offset,
+            limit,
+        } => QueryExpression::slice(without_adaptive_laterals(*inner), offset, limit),
+        QueryExpression::Group {
+            inner,
+            variables,
+            aggregates,
+        } => QueryExpression::group(without_adaptive_laterals(*inner), variables, aggregates),
+        QueryExpression::QuadPattern { .. }
+        | QueryExpression::Path { .. }
+        | QueryExpression::Values { .. }
+        | QueryExpression::Service { .. } => query_expression,
+    }
+}
+
 /// The hash join builds its hash table from the smallest side
 fn hash_join_algorithm(keys: Vec<Variable>, left: Estimate, right: Estimate) -> JoinAlgorithm {
     if right.cardinality < left.cardinality {
@@ -2018,6 +2293,17 @@ fn is_fit_for_for_loop_join(
         QueryExpression::Lateral { left, right } => {
             is_fit_for_for_loop_join(left, global_input_types, entry_types)
                 && is_fit_for_for_loop_join(right, global_input_types, entry_types)
+        }
+        #[cfg(feature = "sep-0006")]
+        QueryExpression::AdaptiveLateral {
+            left,
+            right,
+            hash_right,
+            ..
+        } => {
+            is_fit_for_for_loop_join(left, global_input_types, entry_types)
+                && is_fit_for_for_loop_join(right, global_input_types, entry_types)
+                && is_fit_for_for_loop_join(hash_right, global_input_types, entry_types)
         }
         QueryExpression::LeftJoin {
             left,

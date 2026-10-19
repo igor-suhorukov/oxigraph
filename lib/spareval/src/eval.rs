@@ -36,6 +36,8 @@ use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::iter::{Peekable, empty, once};
 use std::marker::PhantomData;
+#[cfg(feature = "sep-0006")]
+use std::mem::replace;
 use std::mem::take;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
@@ -658,6 +660,22 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
             QueryExpression::Lateral { left, right } => {
                 self.lateral_evaluator(left, right, encoded_variables, &mut stat_children)
             }
+            #[cfg(feature = "sep-0006")]
+            QueryExpression::AdaptiveLateral {
+                left,
+                right,
+                hash_right,
+                keys,
+                max_lateral_rows,
+            } => self.adaptive_lateral_evaluator(
+                left,
+                right,
+                hash_right,
+                keys,
+                *max_lateral_rows,
+                encoded_variables,
+                &mut stat_children,
+            ),
             QueryExpression::Minus {
                 left,
                 right,
@@ -1229,6 +1247,131 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 })
             }))
         }
+    }
+
+    /// Evaluates the right side for each left row like a lateral join until there are too many left rows,
+    /// then switches to a hash join with `hash_right` that is evaluated once.
+    #[cfg(feature = "sep-0006")]
+    fn adaptive_lateral_evaluator(
+        &self,
+        left: &QueryExpression,
+        right: &QueryExpression,
+        hash_right: &QueryExpression,
+        keys: &[Variable],
+        max_lateral_rows: u64,
+        encoded_variables: &mut Vec<Variable>,
+        stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
+    ) -> Result<InternalTupleEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
+        let (left, left_stats) = self.query_expression_evaluator(left, encoded_variables);
+        stat_children.push(left_stats);
+        let left = left?;
+
+        // We check if it is a left join
+        if let (
+            QueryExpression::LeftJoin {
+                left: nested_left,
+                right: nested_right,
+                expression,
+                ..
+            },
+            QueryExpression::LeftJoin {
+                left: hash_nested_left,
+                right: hash_nested_right,
+                ..
+            },
+        ) = (right, hash_right)
+        {
+            if nested_left.is_empty_singleton() && hash_nested_left.is_empty_singleton() {
+                let right =
+                    QueryExpression::filter(nested_right.as_ref().clone(), expression.clone());
+                let (right, right_stats) =
+                    self.query_expression_evaluator(&right, encoded_variables);
+                stat_children.push(right_stats);
+                let right = right?;
+                let (hash_right, hash_right_stats) =
+                    self.query_expression_evaluator(hash_nested_right, encoded_variables);
+                stat_children.push(hash_right_stats);
+                let hash_right = hash_right?;
+                let expression = self.effective_boolean_value_expression_evaluator(
+                    expression,
+                    encoded_variables,
+                    stat_children,
+                )?;
+                let keys = keys
+                    .iter()
+                    .map(|v| encode_variable(encoded_variables, v))
+                    .collect::<Rc<[_]>>();
+                return Ok(Rc::new(move |from| {
+                    let right = Rc::clone(&right);
+                    let hash_right = Rc::clone(&hash_right);
+                    let keys = Rc::clone(&keys);
+                    let expression = Rc::clone(&expression);
+                    let hash_from = from.clone();
+                    Box::new(AdaptiveLateralIterator {
+                        left_iter: left(from.clone()),
+                        lateral_row: Box::new(move |left_tuple| {
+                            Box::new(ForLoopLeftJoinIterator {
+                                right_evaluator: Rc::clone(&right),
+                                left_iter: Box::new(once(Ok(left_tuple))),
+                                current_right: Box::new(empty()),
+                                left_tuple_to_yield: None,
+                            })
+                        }),
+                        hash_join: Some(Box::new(move |left_iter| {
+                            let mut right_values = InternalTupleSet::new(keys.to_vec());
+                            if let Err(error) = right_values.extend(hash_right(hash_from)) {
+                                return Box::new(once(Err(error)));
+                            }
+                            Box::new(HashLeftJoinIterator {
+                                left_iter,
+                                right: right_values,
+                                buffered_results: Vec::new(),
+                                expression,
+                            })
+                        })),
+                        remaining_lateral_rows: max_lateral_rows,
+                        current: Box::new(empty()),
+                        is_hash_join: false,
+                    })
+                }));
+            }
+        }
+
+        let (right, right_stats) = self.query_expression_evaluator(right, encoded_variables);
+        stat_children.push(right_stats);
+        let right = right?;
+        let (hash_right, hash_right_stats) =
+            self.query_expression_evaluator(hash_right, encoded_variables);
+        stat_children.push(hash_right_stats);
+        let hash_right = hash_right?;
+        let keys = keys
+            .iter()
+            .map(|v| encode_variable(encoded_variables, v))
+            .collect::<Rc<[_]>>();
+        Ok(Rc::new(move |from| {
+            let right = Rc::clone(&right);
+            let hash_right = Rc::clone(&hash_right);
+            let keys = Rc::clone(&keys);
+            let hash_from = from.clone();
+            Box::new(AdaptiveLateralIterator {
+                left_iter: left(from.clone()),
+                lateral_row: Box::new(move |left_tuple| right(left_tuple)),
+                hash_join: Some(Box::new(move |left_iter| {
+                    let mut built_values = InternalTupleSet::new(keys.to_vec());
+                    if let Err(error) = built_values.extend(hash_right(hash_from)) {
+                        return Box::new(once(Err(error)));
+                    }
+                    Box::new(HashJoinIterator {
+                        probe_iter: left_iter.peekable(),
+                        built: built_values,
+                        buffered_results: Vec::new(),
+                    })
+                })),
+                remaining_lateral_rows: max_lateral_rows,
+                current: Box::new(empty()),
+                is_hash_join: false,
+            })
+        }))
     }
 
     #[cfg(feature = "sep-0006")]
@@ -3383,6 +3526,56 @@ impl<T: Clone> Iterator for ForLoopLeftJoinIterator<'_, T> {
     }
 }
 
+#[cfg(feature = "sep-0006")]
+type LateralRowEvaluator<'a, T> =
+    Box<dyn Fn(InternalTuple<T>) -> InternalTuplesIterator<'a, T> + 'a>;
+#[cfg(feature = "sep-0006")]
+type HashJoinBuilder<'a, T> =
+    Box<dyn FnOnce(InternalTuplesIterator<'a, T>) -> InternalTuplesIterator<'a, T> + 'a>;
+
+/// Join that evaluates `lateral_row` for each left tuple until `remaining_lateral_rows` is 0
+/// and then uses `hash_join` for the remaining left tuples
+#[cfg(feature = "sep-0006")]
+struct AdaptiveLateralIterator<'a, T> {
+    left_iter: InternalTuplesIterator<'a, T>,
+    lateral_row: LateralRowEvaluator<'a, T>,
+    hash_join: Option<HashJoinBuilder<'a, T>>,
+    remaining_lateral_rows: u64,
+    current: InternalTuplesIterator<'a, T>,
+    is_hash_join: bool,
+}
+
+#[cfg(feature = "sep-0006")]
+impl<'a, T: 'a> Iterator for AdaptiveLateralIterator<'a, T> {
+    type Item = Result<InternalTuple<T>, QueryEvaluationError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(tuple) = self.current.next() {
+                return Some(tuple);
+            }
+            if self.is_hash_join {
+                // The hash join has consumed all the left tuples
+                return None;
+            }
+            let left_tuple = match self.left_iter.next()? {
+                Ok(left_tuple) => left_tuple,
+                Err(error) => return Some(Err(error)),
+            };
+            if self.remaining_lateral_rows == 0 {
+                // There are too many left tuples, we switch to a hash join for the remaining ones
+                let left_iter = replace(&mut self.left_iter, Box::new(empty()));
+                let hash_join = self.hash_join.take()?;
+                self.current = hash_join(Box::new(once(Ok(left_tuple)).chain(left_iter)));
+                self.is_hash_join = true;
+            } else {
+                self.remaining_lateral_rows -= 1;
+                self.current = (self.lateral_row)(left_tuple);
+            }
+        }
+    }
+}
+
 struct UnionIterator<'a, T> {
     plans: Vec<Rc<dyn Fn(InternalTuple<T>) -> InternalTuplesIterator<'a, T> + 'a>>,
     input: InternalTuple<T>,
@@ -4038,6 +4231,32 @@ fn eval_node_label(node: &QueryExpression) -> String {
                 }
             }
             "Lateral".to_owned()
+        }
+        #[cfg(feature = "sep-0006")]
+        QueryExpression::AdaptiveLateral {
+            right,
+            keys,
+            max_lateral_rows,
+            ..
+        } => {
+            if let QueryExpression::LeftJoin {
+                left: nested_left,
+                expression,
+                ..
+            } = right.as_ref()
+            {
+                if nested_left.is_empty_singleton() {
+                    return format!(
+                        "ForLoopLeftJoin(expression = {}, hash join on {} after {max_lateral_rows} rows)",
+                        FormattableExpression(expression),
+                        format_list(keys)
+                    );
+                }
+            }
+            format!(
+                "Lateral(hash join on {} after {max_lateral_rows} rows)",
+                format_list(keys)
+            )
         }
         QueryExpression::LeftJoin {
             algorithm,

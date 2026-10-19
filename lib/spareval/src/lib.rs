@@ -1482,4 +1482,102 @@ mod tests {
             );
         }
     }
+
+    #[cfg(feature = "sep-0006")]
+    #[test]
+    fn adaptive_lateral_switches_to_hash_join() {
+        use sparopt::algebra::{JoinAlgorithm, LeftJoinAlgorithm, TermPattern};
+
+        let ex = |name: String| NamedNode::new(format!("http://example.com/{name}")).unwrap();
+        let predicate_p = ex("p".into());
+        let predicate_q = ex("q".into());
+        let mut dataset = Dataset::new();
+        for i in 0..10 {
+            dataset.insert(Quad::new(
+                ex(format!("s{i}")),
+                predicate_p.clone(),
+                ex(format!("o{i}")),
+                GraphName::DefaultGraph,
+            ));
+            if i % 2 == 0 {
+                for j in 0..2 {
+                    dataset.insert(Quad::new(
+                        ex(format!("o{i}")),
+                        predicate_q.clone(),
+                        ex(format!("z{i}_{j}")),
+                        GraphName::DefaultGraph,
+                    ));
+                }
+            }
+        }
+        let [subject, object, other] = ["s", "o", "z"].map(|name| Variable::new(name).unwrap());
+        let pattern = |subject: &Variable, predicate: &NamedNode, object: &Variable| {
+            QueryExpression::QuadPattern {
+                subject: TermPattern::Variable(subject.clone()),
+                predicate: predicate.clone().into(),
+                object: TermPattern::Variable(object.clone()),
+                graph_name: None,
+            }
+        };
+        let left = pattern(&subject, &predicate_p, &object);
+        let right = pattern(&object, &predicate_q, &other);
+        let optional = |right: QueryExpression| {
+            QueryExpression::left_join(
+                QueryExpression::empty_singleton(),
+                right,
+                true.into(),
+                LeftJoinAlgorithm::default(),
+            )
+        };
+        let evaluate = |pattern: &QueryExpression| {
+            let mut solutions = QueryEvaluator::new()
+                .simple_evaluator(&dataset, QueryDatasetSpecification::new(), None, false)
+                .unwrap()
+                .evaluate_select(pattern, [])
+                .0
+                .unwrap()
+                .map(|solution| format!("{:?}", solution.unwrap()))
+                .collect::<Vec<_>>();
+            solutions.sort();
+            solutions
+        };
+
+        let join = evaluate(&QueryExpression::join(
+            left.clone(),
+            right.clone(),
+            JoinAlgorithm::default(),
+        ));
+        let left_join = evaluate(&QueryExpression::left_join(
+            left.clone(),
+            right.clone(),
+            true.into(),
+            LeftJoinAlgorithm::default(),
+        ));
+        assert_eq!(join.len(), 10);
+        assert_eq!(left_join.len(), 15);
+        for max_lateral_rows in [0, 1, 3, 9, 10, 100] {
+            assert_eq!(
+                evaluate(&QueryExpression::adaptive_lateral(
+                    left.clone(),
+                    right.clone(),
+                    right.clone(),
+                    vec![object.clone()],
+                    max_lateral_rows,
+                )),
+                join,
+                "Join after {max_lateral_rows} rows"
+            );
+            assert_eq!(
+                evaluate(&QueryExpression::adaptive_lateral(
+                    left.clone(),
+                    optional(right.clone()),
+                    optional(right.clone()),
+                    vec![object.clone()],
+                    max_lateral_rows,
+                )),
+                left_join,
+                "Left join after {max_lateral_rows} rows"
+            );
+        }
+    }
 }

@@ -135,7 +135,8 @@ impl<'a> Estimator<'a> {
                 )
             }
             #[cfg(feature = "sep-0006")]
-            QueryExpression::Lateral { left, right } => {
+            QueryExpression::Lateral { left, right }
+            | QueryExpression::AdaptiveLateral { left, right, .. } => {
                 let left_estimate = self.estimate(left, input_types);
                 let left_types = infer_query_expression_types(left, input_types.clone());
                 let right_estimate = self.estimate_lateral_right(right, &left_types);
