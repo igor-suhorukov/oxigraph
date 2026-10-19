@@ -8,7 +8,9 @@ use oxsdatatypes::Boolean;
 use oxstr::OxString;
 #[cfg(feature = "rdf-12")]
 use spareval::ExpressionTriple;
-use spareval::{ExpressionTerm, InternalQuad, InternalTriple, QueryableDataset};
+use spareval::{
+    ExpressionTerm, InternalQuad, InternalTriple, PredicateStatistics, QueryableDataset,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -79,6 +81,43 @@ impl<'a> QueryableDataset<'a> for DatasetView<'a> {
 
     fn contains_internal_graph_name(&self, graph_name: &EncodedTerm) -> Result<bool, StorageError> {
         self.reader.contains_named_graph(graph_name)
+    }
+
+    fn internal_quad_count_estimate(
+        &self,
+        subject: Option<&EncodedTerm>,
+        predicate: Option<&EncodedTerm>,
+        object: Option<&EncodedTerm>,
+        graph_name: Option<Option<&EncodedTerm>>,
+    ) -> Result<Option<u64>, StorageError> {
+        self.reader
+            .quad_count_estimate(subject, predicate, object, graph_name)
+    }
+
+    fn internal_predicate_statistics(
+        &self,
+        predicate: &EncodedTerm,
+        graph_name: Option<Option<&EncodedTerm>>,
+    ) -> Result<Option<PredicateStatistics>, StorageError> {
+        Ok(self
+            .reader
+            .predicate_statistics(predicate, graph_name)
+            .map(|counts| PredicateStatistics {
+                triples: counts.triples,
+                distinct_subjects: counts.distinct_subjects,
+                distinct_objects: counts.distinct_objects,
+            }))
+    }
+
+    fn internal_distinct_predicate_count_estimate(
+        &self,
+        graph_name: Option<Option<&EncodedTerm>>,
+    ) -> Result<Option<u64>, StorageError> {
+        Ok(self.reader.distinct_predicate_count_estimate(graph_name))
+    }
+
+    fn internal_named_graph_count_estimate(&self) -> Result<Option<u64>, StorageError> {
+        self.reader.named_graph_count_estimate()
     }
 
     fn internalize_term(&self, term: Term) -> Result<EncodedTerm, StorageError> {

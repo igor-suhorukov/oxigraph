@@ -458,6 +458,22 @@ pub enum QueryExpression {
     /// Lateral join i.e. evaluate right for all result row of left
     #[cfg(feature = "sep-0006")]
     Lateral { left: Box<Self>, right: Box<Self> },
+    /// A join chosen by the optimizer to be evaluated like a [`Lateral`](Self::Lateral)
+    /// but that switches to a hash join if `left` returns more than `max_lateral_rows` rows.
+    ///
+    /// It is equivalent to `Lateral(left, right)` and to `Join(left, hash_right)`.
+    /// If `right` is a left join with an empty singleton on its left, it is a left join
+    /// and `hash_right` must also be one, with the same expression.
+    #[cfg(feature = "sep-0006")]
+    AdaptiveLateral {
+        left: Box<Self>,
+        /// Evaluated for each row of `left`
+        right: Box<Self>,
+        /// Evaluated once and joined with the remaining rows of `left` using a hash join on `keys`
+        hash_right: Box<Self>,
+        keys: Vec<Variable>,
+        max_lateral_rows: u64,
+    },
     /// [Filter](https://www.w3.org/TR/sparql11-query/#defn_algFilter).
     Filter {
         expression: Expression,
@@ -584,6 +600,28 @@ impl QueryExpression {
         Self::Lateral {
             left: Box::new(left),
             right: Box::new(right),
+        }
+    }
+
+    /// Builds an [`AdaptiveLateral`](Self::AdaptiveLateral)
+    #[cfg(feature = "sep-0006")]
+    pub fn adaptive_lateral(
+        left: Self,
+        right: Self,
+        hash_right: Self,
+        keys: Vec<Variable>,
+        max_lateral_rows: u64,
+    ) -> Self {
+        let lateral = Self::lateral(left, right);
+        let Self::Lateral { left, right } = lateral else {
+            return lateral; // It has been simplified
+        };
+        Self::AdaptiveLateral {
+            left,
+            right,
+            hash_right: Box::new(hash_right),
+            keys,
+            max_lateral_rows,
         }
     }
 
@@ -872,6 +910,17 @@ impl QueryExpression {
                 left.lookup_used_variables(callback);
                 right.lookup_used_variables(callback);
             }
+            #[cfg(feature = "sep-0006")]
+            Self::AdaptiveLateral {
+                left,
+                right,
+                hash_right,
+                ..
+            } => {
+                left.lookup_used_variables(callback);
+                right.lookup_used_variables(callback);
+                hash_right.lookup_used_variables(callback);
+            }
             Self::LeftJoin {
                 left,
                 right,
@@ -1147,7 +1196,8 @@ impl From<&QueryExpression> for AlQueryExpression {
                 }
             }
             #[cfg(feature = "sep-0006")]
-            QueryExpression::Lateral { left, right } => {
+            QueryExpression::Lateral { left, right }
+            | QueryExpression::AdaptiveLateral { left, right, .. } => {
                 match (left.as_ref().into(), right.as_ref().into()) {
                     (Self::Bgp { patterns: mut left }, Self::Bgp { patterns: right }) => {
                         left.extend(right);
@@ -1246,6 +1296,7 @@ impl From<&QueryExpression> for AlQueryExpression {
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
 pub enum JoinAlgorithm {
     HashBuildLeftProbeRight { keys: Vec<Variable> },
+    HashBuildRightProbeLeft { keys: Vec<Variable> },
 }
 
 impl Default for JoinAlgorithm {

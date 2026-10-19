@@ -10,11 +10,14 @@ mod eval;
 mod expression;
 mod model;
 mod service;
+mod statistics;
 mod update;
 
 #[cfg(feature = "sparql-12")]
 pub use crate::dataset::ExpressionTriple;
-pub use crate::dataset::{ExpressionTerm, InternalQuad, InternalTriple, QueryableDataset};
+pub use crate::dataset::{
+    ExpressionTerm, InternalQuad, InternalTriple, PredicateStatistics, QueryableDataset,
+};
 pub use crate::error::QueryEvaluationError;
 pub use crate::eval::CancellationToken;
 use crate::eval::{EvalNodeWithStats, SimpleEvaluator, Timer};
@@ -24,6 +27,7 @@ use crate::expression::{
 pub use crate::model::{QueryResults, QuerySolution, QuerySolutionIter, QueryTripleIter};
 use crate::service::ServiceHandlerRegistry;
 pub use crate::service::{DefaultServiceHandler, ServiceHandler};
+use crate::statistics::DatasetStatistics;
 pub use crate::update::{DeleteInsertIter, DeleteInsertQuad};
 use json_event_parser::{JsonEvent, WriterJsonSerializer};
 use oxiri::Iri;
@@ -537,6 +541,23 @@ impl QueryEvaluator {
             explain,
         )
     }
+
+    /// Optimizes the query expression using the dataset statistics
+    fn optimize<'a>(
+        &self,
+        pattern: QueryExpression,
+        dataset: &impl QueryableDataset<'a>,
+        dataset_spec: &QueryDatasetSpecification,
+    ) -> QueryExpression {
+        if self.without_optimizations {
+            pattern
+        } else {
+            Optimizer::optimize_query_expression_with(
+                pattern,
+                &DatasetStatistics::new(dataset, dataset_spec),
+            )
+        }
+    }
 }
 
 /// A prepared SPARQL query.
@@ -626,6 +647,48 @@ impl PreparedQuery<'_> {
         self.evaluate(dataset, false).0
     }
 
+    /// Plans the query against the given [`QueryableDataset`] without evaluating it.
+    ///
+    /// The returned explanation contains the evaluation plan without statistics.
+    /// It is cheap: only the statistics used by the query optimizer are read from the dataset.
+    ///
+    /// ```
+    /// use oxrdf::Dataset;
+    /// use spareval::QueryEvaluator;
+    /// use spargebra::SparqlParser;
+    ///
+    /// let query = SparqlParser::new().parse_query("SELECT * WHERE { ?s ?p ?o }")?;
+    /// let explanation = QueryEvaluator::new().prepare(&query).plan(&Dataset::new())?;
+    /// let mut buf = Vec::new();
+    /// explanation.write_in_json(&mut buf)?;
+    /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
+    /// ```
+    pub fn plan<'b>(
+        self,
+        dataset: impl QueryableDataset<'b>,
+    ) -> Result<QueryExplanation, QueryEvaluationError> {
+        let start_planning = Timer::now();
+        let (pattern, base_iri) = match self.query {
+            Query::Select(query) => (&query.expression, query.base_iri.as_ref()),
+            Query::Ask(query) => (&query.expression, query.base_iri.as_ref()),
+            Query::Construct(query) => (&query.expression, query.base_iri.as_ref()),
+            Query::Describe(query) => (&query.pattern, query.base_iri.as_ref()),
+        };
+        let pattern =
+            self.evaluator
+                .optimize(QueryExpression::from(pattern), &dataset, &self.dataset);
+        let planning_duration = start_planning.elapsed();
+        let plan = self
+            .evaluator
+            .simple_evaluator(dataset, self.dataset, base_iri, true)?
+            .plan(&pattern);
+        Ok(QueryExplanation {
+            inner: plan,
+            with_stats: false,
+            planning_duration,
+        })
+    }
+
     pub fn explain<'b>(
         self,
         dataset: impl QueryableDataset<'b>,
@@ -647,10 +710,11 @@ impl PreparedQuery<'_> {
         let start_planning = Timer::now();
         let (results, plan_node_with_stats, planning_duration) = match self.query {
             Query::Select(query) => {
-                let mut pattern = QueryExpression::from(&query.expression);
-                if !self.evaluator.without_optimizations {
-                    pattern = Optimizer::optimize_query_expression(pattern);
-                }
+                let pattern = self.evaluator.optimize(
+                    QueryExpression::from(&query.expression),
+                    &dataset,
+                    &self.dataset,
+                );
                 let planning_duration = start_planning.elapsed();
                 let (results, explanation) = match self.evaluator.simple_evaluator(
                     dataset,
@@ -668,10 +732,11 @@ impl PreparedQuery<'_> {
                 )
             }
             Query::Ask(query) => {
-                let mut pattern = QueryExpression::from(&query.expression);
-                if !self.evaluator.without_optimizations {
-                    pattern = Optimizer::optimize_query_expression(pattern);
-                }
+                let pattern = self.evaluator.optimize(
+                    QueryExpression::from(&query.expression),
+                    &dataset,
+                    &self.dataset,
+                );
                 let planning_duration = start_planning.elapsed();
                 let (results, explanation) = match self.evaluator.simple_evaluator(
                     dataset,
@@ -689,10 +754,11 @@ impl PreparedQuery<'_> {
                 )
             }
             Query::Construct(query) => {
-                let mut pattern = QueryExpression::from(&query.expression);
-                if !self.evaluator.without_optimizations {
-                    pattern = Optimizer::optimize_query_expression(pattern);
-                }
+                let pattern = self.evaluator.optimize(
+                    QueryExpression::from(&query.expression),
+                    &dataset,
+                    &self.dataset,
+                );
                 let planning_duration = start_planning.elapsed();
                 let (results, explanation) = match self.evaluator.simple_evaluator(
                     dataset,
@@ -712,10 +778,11 @@ impl PreparedQuery<'_> {
                 )
             }
             Query::Describe(query) => {
-                let mut pattern = QueryExpression::from(&query.pattern);
-                if !self.evaluator.without_optimizations {
-                    pattern = Optimizer::optimize_query_expression(pattern);
-                }
+                let pattern = self.evaluator.optimize(
+                    QueryExpression::from(&query.pattern),
+                    &dataset,
+                    &self.dataset,
+                );
                 let planning_duration = start_planning.elapsed();
                 let (results, explanation) = match self.evaluator.simple_evaluator(
                     dataset,
@@ -815,10 +882,11 @@ impl<'a> PreparedDeleteInsertUpdate<'a> {
         self,
         dataset: impl QueryableDataset<'b>,
     ) -> Result<DeleteInsertIter<'b, 'a>, QueryEvaluationError> {
-        let mut pattern = QueryExpression::from(&*self.operation.pattern);
-        if !self.evaluator.without_optimizations {
-            pattern = Optimizer::optimize_query_expression(pattern);
-        }
+        let pattern = self.evaluator.optimize(
+            QueryExpression::from(&*self.operation.pattern),
+            &dataset,
+            &self.dataset,
+        );
         let (solutions, _) = self
             .evaluator
             .simple_evaluator(dataset, self.dataset, self.base_iri, false)?
@@ -1425,5 +1493,103 @@ mod tests {
             .prepare(&query)
             .explain(&Dataset::new());
         assert!(format!("{explanation:?}").contains("Filter("));
+    }
+
+    #[cfg(feature = "sep-0006")]
+    #[test]
+    fn adaptive_lateral_switches_to_hash_join() {
+        use sparopt::algebra::{JoinAlgorithm, LeftJoinAlgorithm, TermPattern};
+
+        let ex = |name: String| NamedNode::new(format!("http://example.com/{name}")).unwrap();
+        let predicate_p = ex("p".into());
+        let predicate_q = ex("q".into());
+        let mut dataset = Dataset::new();
+        for i in 0..10 {
+            dataset.insert(Quad::new(
+                ex(format!("s{i}")),
+                predicate_p.clone(),
+                ex(format!("o{i}")),
+                GraphName::DefaultGraph,
+            ));
+            if i % 2 == 0 {
+                for j in 0..2 {
+                    dataset.insert(Quad::new(
+                        ex(format!("o{i}")),
+                        predicate_q.clone(),
+                        ex(format!("z{i}_{j}")),
+                        GraphName::DefaultGraph,
+                    ));
+                }
+            }
+        }
+        let [subject, object, other] = ["s", "o", "z"].map(|name| Variable::new(name).unwrap());
+        let pattern = |subject: &Variable, predicate: &NamedNode, object: &Variable| {
+            QueryExpression::QuadPattern {
+                subject: TermPattern::Variable(subject.clone()),
+                predicate: predicate.clone().into(),
+                object: TermPattern::Variable(object.clone()),
+                graph_name: None,
+            }
+        };
+        let left = pattern(&subject, &predicate_p, &object);
+        let right = pattern(&object, &predicate_q, &other);
+        let optional = |right: QueryExpression| {
+            QueryExpression::left_join(
+                QueryExpression::empty_singleton(),
+                right,
+                true.into(),
+                LeftJoinAlgorithm::default(),
+            )
+        };
+        let evaluate = |pattern: &QueryExpression| {
+            let mut solutions = QueryEvaluator::new()
+                .simple_evaluator(&dataset, QueryDatasetSpecification::new(), None, false)
+                .unwrap()
+                .evaluate_select(pattern, [])
+                .0
+                .unwrap()
+                .map(|solution| format!("{:?}", solution.unwrap()))
+                .collect::<Vec<_>>();
+            solutions.sort();
+            solutions
+        };
+
+        let join = evaluate(&QueryExpression::join(
+            left.clone(),
+            right.clone(),
+            JoinAlgorithm::default(),
+        ));
+        let left_join = evaluate(&QueryExpression::left_join(
+            left.clone(),
+            right.clone(),
+            true.into(),
+            LeftJoinAlgorithm::default(),
+        ));
+        assert_eq!(join.len(), 10);
+        assert_eq!(left_join.len(), 15);
+        for max_lateral_rows in [0, 1, 3, 9, 10, 100] {
+            assert_eq!(
+                evaluate(&QueryExpression::adaptive_lateral(
+                    left.clone(),
+                    right.clone(),
+                    right.clone(),
+                    vec![object.clone()],
+                    max_lateral_rows,
+                )),
+                join,
+                "Join after {max_lateral_rows} rows"
+            );
+            assert_eq!(
+                evaluate(&QueryExpression::adaptive_lateral(
+                    left.clone(),
+                    optional(right.clone()),
+                    optional(right.clone()),
+                    vec![object.clone()],
+                    max_lateral_rows,
+                )),
+                left_join,
+                "Left join after {max_lateral_rows} rows"
+            );
+        }
     }
 }

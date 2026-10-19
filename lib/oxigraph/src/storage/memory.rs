@@ -4,11 +4,12 @@ pub use crate::storage::error::StorageError;
 use crate::storage::numeric_encoder::{
     Decoder, EncodedQuad, EncodedTerm, StrHash, StrHashHasher, StrLookup, insert_term,
 };
+use crate::storage::statistics::PredicateCounts;
 use dashmap::iter::Iter;
 use dashmap::mapref::entry::Entry;
 use dashmap::{DashMap, DashSet};
 use oxstr::OxString;
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashSet, FxHasher};
 use std::borrow::Borrow;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::marker::PhantomData;
@@ -225,6 +226,141 @@ impl<'a> MemoryStorageReader<'a> {
 
     pub fn contains_str(&self, key: &StrHash) -> bool {
         self.storage.id2str.contains_key(key)
+    }
+
+    /// Counts the quads matching the pattern up to `cap`
+    ///
+    /// For `graph_name`, `Some(None)` encodes the default graph, `Some(Some(_))` a named graph and `None` any named graph.
+    pub fn count_quads_up_to(
+        &self,
+        subject: Option<&EncodedTerm>,
+        predicate: Option<&EncodedTerm>,
+        object: Option<&EncodedTerm>,
+        graph_name: Option<Option<&EncodedTerm>>,
+        cap: u64,
+    ) -> u64 {
+        let mut count = 0;
+        for quad in self.quads_for_pattern(
+            subject,
+            predicate,
+            object,
+            graph_name.map(|g| g.unwrap_or(&EncodedTerm::DefaultGraph)),
+        ) {
+            if graph_name.is_none() && quad.graph_name.is_default_graph() {
+                continue;
+            }
+            count += 1;
+            if count >= cap {
+                break;
+            }
+        }
+        count
+    }
+
+    /// An upper bound of the number of quads matching the pattern, using the index sizes
+    ///
+    /// The index sizes also count removed quads.
+    pub fn quad_count_upper_bound(
+        &self,
+        subject: Option<&EncodedTerm>,
+        predicate: Option<&EncodedTerm>,
+        object: Option<&EncodedTerm>,
+        graph_name: Option<&EncodedTerm>,
+    ) -> u64 {
+        fn index_size(
+            map: &DashMap<EncodedTerm, (Weak<QuadListNode>, u64), BuildHasherDefault<FxHasher>>,
+            term: Option<&EncodedTerm>,
+        ) -> u64 {
+            term.map_or(u64::MAX, |term| {
+                map.view(term, |_, (_, count)| *count).unwrap_or(0)
+            })
+        }
+        let content = &self.storage.content;
+        let bound = index_size(&content.last_quad_by_subject, subject)
+            .min(index_size(&content.last_quad_by_predicate, predicate))
+            .min(index_size(&content.last_quad_by_object, object))
+            .min(index_size(&content.last_quad_by_graph_name, graph_name));
+        if bound == u64::MAX {
+            content.quad_set.len().try_into().unwrap_or(u64::MAX)
+        } else {
+            bound
+        }
+    }
+
+    /// Estimates the statistics of a predicate from a sample of its triples
+    pub fn sample_predicate_counts(
+        &self,
+        predicate: &EncodedTerm,
+        graph_name: Option<Option<&EncodedTerm>>,
+        sample_size: u64,
+    ) -> PredicateCounts {
+        let mut sampled = 0;
+        let mut subjects = FxHashSet::default();
+        let mut objects = FxHashSet::default();
+        for quad in self.quads_for_pattern(
+            None,
+            Some(predicate),
+            None,
+            graph_name.map(|g| g.unwrap_or(&EncodedTerm::DefaultGraph)),
+        ) {
+            if graph_name.is_none() && quad.graph_name.is_default_graph() {
+                continue;
+            }
+            sampled += 1;
+            subjects.insert(quad.subject);
+            objects.insert(quad.object);
+            if sampled >= sample_size {
+                break;
+            }
+        }
+        let distinct_subjects = u64::try_from(subjects.len()).unwrap_or(u64::MAX);
+        let distinct_objects = u64::try_from(objects.len()).unwrap_or(u64::MAX);
+        if sampled < sample_size {
+            // We have seen everything
+            return PredicateCounts {
+                triples: sampled,
+                distinct_subjects,
+                distinct_objects,
+            };
+        }
+        let triples = self
+            .quad_count_upper_bound(None, Some(predicate), None, None)
+            .max(sampled);
+        // If the values repeat a lot in the sample, we assume we have seen most of them,
+        // otherwise we extrapolate.
+        let extrapolate = |distinct: u64| {
+            if distinct.saturating_mul(10) <= sampled {
+                distinct
+            } else {
+                distinct.saturating_mul(triples) / sampled
+            }
+        };
+        PredicateCounts {
+            triples,
+            distinct_subjects: extrapolate(distinct_subjects),
+            distinct_objects: extrapolate(distinct_objects),
+        }
+    }
+
+    /// An upper bound of the number of distinct predicates in all the graphs (removed ones are also counted)
+    pub fn distinct_predicate_count(&self, _graph_name: Option<Option<&EncodedTerm>>) -> u64 {
+        self.storage
+            .content
+            .last_quad_by_predicate
+            .len()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    pub fn named_graph_count(&self) -> u64 {
+        self.storage
+            .content
+            .graphs
+            .iter()
+            .filter(|range| self.is_in_range(range))
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 
     /// Validate that all the storage invariants held in the data

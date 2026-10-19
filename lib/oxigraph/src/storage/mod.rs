@@ -30,6 +30,13 @@ mod rocksdb;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 mod rocksdb_wrapper;
 pub mod small_string;
+mod statistics;
+
+pub use crate::storage::statistics::PredicateCounts;
+use crate::storage::statistics::QUAD_COUNT_CAP;
+
+/// Number of triples sampled to estimate the statistics of a predicate in the memory storage
+const PREDICATE_SAMPLE_SIZE: u64 = 1_000;
 
 pub const DEFAULT_BULK_LOAD_BATCH_SIZE: usize = 1_000_000;
 
@@ -96,6 +103,20 @@ impl Storage {
         Ok(Self {
             kind: StorageKind::RocksDb(RocksDbStorage::open_read_only(path)?),
         })
+    }
+
+    /// Computes the statistics used by the query optimizer, and saves them if relevant
+    #[cfg_attr(
+        not(all(not(target_family = "wasm"), feature = "rocksdb")),
+        expect(clippy::unnecessary_wraps)
+    )]
+    pub fn update_statistics(&self) -> Result<(), StorageError> {
+        match &self.kind {
+            #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+            StorageKind::RocksDb(storage) => storage.update_statistics(),
+            // The in-memory storage computes its statistics on the fly
+            StorageKind::Memory(_) => Ok(()),
+        }
     }
 
     pub fn snapshot(&self) -> StorageReader<'static> {
@@ -324,6 +345,133 @@ impl<'a> StorageReader<'a> {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.validate(),
             StorageReaderKind::Memory(reader) => reader.validate(),
+        }
+    }
+
+    /// Estimates the number of quads matching the pattern, for the query optimizer
+    ///
+    /// For `graph_name`, `Some(None)` encodes the default graph, `Some(Some(_))` a named graph and `None` any named graph.
+    pub fn quad_count_estimate(
+        &self,
+        subject: Option<&EncodedTerm>,
+        predicate: Option<&EncodedTerm>,
+        object: Option<&EncodedTerm>,
+        graph_name: Option<Option<&EncodedTerm>>,
+    ) -> Result<Option<u64>, StorageError> {
+        match &self.kind {
+            #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+            StorageReaderKind::RocksDb(reader) => {
+                let statistics = reader.statistics();
+                let graph_statistics = statistics
+                    .as_deref()
+                    .and_then(|statistics| statistics.graph(graph_name));
+                let has_constant = subject.is_some() || object.is_some();
+                if !has_constant {
+                    if let Some(graph_statistics) = graph_statistics {
+                        // The summary is exact
+                        return Ok(graph_statistics.quad_count_estimate(None, predicate, None));
+                    }
+                }
+                let count = reader.count_quads_up_to(
+                    subject,
+                    predicate,
+                    object,
+                    graph_name,
+                    QUAD_COUNT_CAP,
+                )?;
+                if count < QUAD_COUNT_CAP {
+                    return Ok(Some(count));
+                }
+                // Too many to count
+                if let Some(estimate) = graph_statistics.and_then(|graph_statistics| {
+                    graph_statistics.quad_count_estimate(subject, predicate, object)
+                }) {
+                    return Ok(Some(estimate.max(count)));
+                }
+                // The cap is a lower bound, it is better than nothing if we have constants
+                Ok(has_constant.then_some(count))
+            }
+            StorageReaderKind::Memory(reader) => {
+                let count = reader.count_quads_up_to(
+                    subject,
+                    predicate,
+                    object,
+                    graph_name,
+                    QUAD_COUNT_CAP,
+                );
+                Ok(Some(if count < QUAD_COUNT_CAP {
+                    count
+                } else {
+                    reader
+                        .quad_count_upper_bound(subject, predicate, object, graph_name.flatten())
+                        .max(count)
+                }))
+            }
+        }
+    }
+
+    /// Statistics about the triples using the predicate, for the query optimizer
+    ///
+    /// For `graph_name`, `Some(None)` encodes the default graph, `Some(Some(_))` a named graph and `None` any named graph.
+    pub fn predicate_statistics(
+        &self,
+        predicate: &EncodedTerm,
+        graph_name: Option<Option<&EncodedTerm>>,
+    ) -> Option<PredicateCounts> {
+        match &self.kind {
+            #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+            StorageReaderKind::RocksDb(reader) => Some(
+                reader
+                    .statistics()?
+                    .graph(graph_name)?
+                    .predicates
+                    .get(predicate)
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+            StorageReaderKind::Memory(reader) => {
+                Some(reader.sample_predicate_counts(predicate, graph_name, PREDICATE_SAMPLE_SIZE))
+            }
+        }
+    }
+
+    /// Estimates the number of distinct predicates, for the query optimizer
+    pub fn distinct_predicate_count_estimate(
+        &self,
+        graph_name: Option<Option<&EncodedTerm>>,
+    ) -> Option<u64> {
+        match &self.kind {
+            #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+            StorageReaderKind::RocksDb(reader) => reader
+                .statistics()?
+                .graph(graph_name)?
+                .predicates
+                .len()
+                .try_into()
+                .ok(),
+            StorageReaderKind::Memory(reader) => Some(reader.distinct_predicate_count(graph_name)),
+        }
+    }
+
+    /// Estimates the number of named graphs, for the query optimizer
+    pub fn named_graph_count_estimate(&self) -> Result<Option<u64>, StorageError> {
+        match &self.kind {
+            #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+            StorageReaderKind::RocksDb(reader) => {
+                if let Some(statistics) = reader.statistics() {
+                    return Ok(Some(statistics.named_graph_count));
+                }
+                let mut count = 0;
+                for graph in reader.named_graphs() {
+                    graph?;
+                    count += 1;
+                    if count >= QUAD_COUNT_CAP {
+                        break;
+                    }
+                }
+                Ok(Some(count))
+            }
+            StorageReaderKind::Memory(reader) => Ok(Some(reader.named_graph_count())),
         }
     }
 }

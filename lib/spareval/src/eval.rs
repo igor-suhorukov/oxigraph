@@ -36,6 +36,8 @@ use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::iter::{Peekable, empty, once};
 use std::marker::PhantomData;
+#[cfg(feature = "sep-0006")]
+use std::mem::replace;
 use std::mem::take;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
@@ -456,6 +458,12 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         })
     }
 
+    /// Builds the evaluation plan without evaluating it
+    pub fn plan(&self, expression: &QueryExpression) -> Rc<EvalNodeWithStats> {
+        self.query_expression_evaluator(expression, &mut Vec::new())
+            .1
+    }
+
     pub fn evaluate_select(
         &self,
         expression: &QueryExpression,
@@ -654,6 +662,22 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
             QueryExpression::Lateral { left, right } => {
                 self.lateral_evaluator(left, right, encoded_variables, &mut stat_children)
             }
+            #[cfg(feature = "sep-0006")]
+            QueryExpression::AdaptiveLateral {
+                left,
+                right,
+                hash_right,
+                keys,
+                max_lateral_rows,
+            } => self.adaptive_lateral_evaluator(
+                left,
+                right,
+                hash_right,
+                keys,
+                *max_lateral_rows,
+                encoded_variables,
+                &mut stat_children,
+            ),
             QueryExpression::Minus {
                 left,
                 right,
@@ -1160,71 +1184,211 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         let left = left?;
         let right = right?;
 
-        match algorithm {
-            JoinAlgorithm::HashBuildLeftProbeRight { keys } => {
-                let build = left;
-                let probe = right;
-                if keys.is_empty() {
-                    // Cartesian product
-                    Ok(Rc::new(move |from| {
-                        let built_values = build(from.clone()).collect::<Result<Vec<_>, _>>();
-                        if built_values.as_ref().is_err_and(|e| !e.can_be_silent()) {
-                            // We return non-silent errors proactively to abort execution
-                            return Box::new(built_values.err().into_iter().map(Err));
-                        }
-                        if built_values.as_ref().is_ok_and(Vec::is_empty) {
-                            // We don't bother to execute the other side
-                            return Box::new(empty());
-                        }
-                        let mut probe_iter = probe(from).peekable();
-                        if probe_iter.peek().is_none() {
-                            // We know it's empty and can discard errors
-                            return Box::new(empty());
-                        }
-                        match built_values {
-                            Ok(built_values) => Box::new(CartesianProductJoinIterator {
-                                probe_iter,
-                                probe_tuple: None,
-                                built: built_values,
-                                built_offset: 0,
-                            }),
-                            Err(error) => Box::new(once(Err(error))),
-                        }
-                    }))
-                } else {
-                    // Real hash join
-                    let keys = keys
-                        .iter()
-                        .map(|v| encode_variable(encoded_variables, v))
-                        .collect::<Vec<_>>();
-                    Ok(Rc::new(move |from| {
-                        let mut built_values = InternalTupleSet::new(keys.clone());
-                        let error = built_values.extend(build(from.clone())).err();
-                        if error.as_ref().is_some_and(|e| !e.can_be_silent()) {
-                            // We return non-silent errors proactively to abort execution
-                            return Box::new(error.into_iter().map(Err));
-                        }
-                        if built_values.is_empty() && error.is_none() {
-                            // We don't bother to execute the other side
-                            return Box::new(empty());
-                        }
-                        let mut probe_iter = probe(from).peekable();
-                        if probe_iter.peek().is_none() {
-                            // We know it's empty and can discard errors
-                            return Box::new(empty());
-                        }
-                        if let Some(error) = error {
-                            return Box::new(once(Err(error)));
-                        }
-                        Box::new(HashJoinIterator {
-                            probe_iter,
-                            built: built_values,
-                            buffered_results: Vec::new(),
-                        })
-                    }))
+        let (build, probe, keys) = match algorithm {
+            JoinAlgorithm::HashBuildLeftProbeRight { keys } => (left, right, keys),
+            JoinAlgorithm::HashBuildRightProbeLeft { keys } => (right, left, keys),
+        };
+        let cancellation_token = self.dataset.cancellation_token.clone();
+        if keys.is_empty() {
+            // Cartesian product
+            Ok(Rc::new(move |from| {
+                let built_values = cancellable(build(from.clone()), &cancellation_token)
+                    .collect::<Result<Vec<_>, _>>();
+                if built_values.as_ref().is_err_and(|e| !e.can_be_silent()) {
+                    // We return non-silent errors proactively to abort execution
+                    return Box::new(built_values.err().into_iter().map(Err));
                 }
+                if built_values.as_ref().is_ok_and(Vec::is_empty) {
+                    // We don't bother to execute the other side
+                    return Box::new(empty());
+                }
+                let mut probe_iter = probe(from).peekable();
+                if probe_iter.peek().is_none() {
+                    // We know it's empty and can discard errors
+                    return Box::new(empty());
+                }
+                match built_values {
+                    Ok(built_values) => Box::new(CartesianProductJoinIterator {
+                        probe_iter,
+                        probe_tuple: None,
+                        built: built_values,
+                        built_offset: 0,
+                        cancellation_token: cancellation_token.clone(),
+                    }),
+                    Err(error) => Box::new(once(Err(error))),
+                }
+            }))
+        } else {
+            // Real hash join
+            let keys = keys
+                .iter()
+                .map(|v| encode_variable(encoded_variables, v))
+                .collect::<Vec<_>>();
+            Ok(Rc::new(move |from| {
+                let mut built_values = InternalTupleSet::new(keys.clone());
+                let error = built_values
+                    .extend(cancellable(build(from.clone()), &cancellation_token))
+                    .err();
+                if error.as_ref().is_some_and(|e| !e.can_be_silent()) {
+                    // We return non-silent errors proactively to abort execution
+                    return Box::new(error.into_iter().map(Err));
+                }
+                if built_values.is_empty() && error.is_none() {
+                    // We don't bother to execute the other side
+                    return Box::new(empty());
+                }
+                let mut probe_iter = probe(from).peekable();
+                if probe_iter.peek().is_none() {
+                    // We know it's empty and can discard errors
+                    return Box::new(empty());
+                }
+                if let Some(error) = error {
+                    return Box::new(once(Err(error)));
+                }
+                Box::new(HashJoinIterator {
+                    probe_iter,
+                    built: built_values,
+                    buffered_results: Vec::new(),
+                })
+            }))
+        }
+    }
+
+    /// Evaluates the right side for each left row like a lateral join until there are too many left rows,
+    /// then switches to a hash join with `hash_right` that is evaluated once.
+    #[cfg(feature = "sep-0006")]
+    fn adaptive_lateral_evaluator(
+        &self,
+        left: &QueryExpression,
+        right: &QueryExpression,
+        hash_right: &QueryExpression,
+        keys: &[Variable],
+        max_lateral_rows: u64,
+        encoded_variables: &mut Vec<Variable>,
+        stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
+    ) -> Result<InternalTupleEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
+        let (left, left_stats) = self.query_expression_evaluator(left, encoded_variables);
+        stat_children.push(left_stats);
+        let left = left?;
+        let cancellation_token = self.dataset.cancellation_token.clone();
+
+        // We check if it is a left join
+        if let (
+            QueryExpression::LeftJoin {
+                left: nested_left,
+                right: nested_right,
+                expression,
+                ..
+            },
+            QueryExpression::LeftJoin {
+                left: hash_nested_left,
+                right: hash_nested_right,
+                ..
+            },
+        ) = (right, hash_right)
+        {
+            if nested_left.is_empty_singleton() && hash_nested_left.is_empty_singleton() {
+                let right =
+                    QueryExpression::filter(nested_right.as_ref().clone(), expression.clone());
+                let (right, right_stats) =
+                    self.query_expression_evaluator(&right, encoded_variables);
+                stat_children.push(right_stats);
+                let right = right?;
+                let (hash_right, hash_right_stats) =
+                    self.query_expression_evaluator(hash_nested_right, encoded_variables);
+                stat_children.push(hash_right_stats);
+                let hash_right = hash_right?;
+                let expression = self.effective_boolean_value_expression_evaluator(
+                    expression,
+                    encoded_variables,
+                    stat_children,
+                )?;
+                let keys = keys
+                    .iter()
+                    .map(|v| encode_variable(encoded_variables, v))
+                    .collect::<Rc<[_]>>();
+                return Ok(Rc::new(move |from| {
+                    let right = Rc::clone(&right);
+                    let row_cancellation_token = cancellation_token.clone();
+                    let hash_right = Rc::clone(&hash_right);
+                    let keys = Rc::clone(&keys);
+                    let expression = Rc::clone(&expression);
+                    let hash_cancellation_token = cancellation_token.clone();
+                    let hash_from = from.clone();
+                    Box::new(AdaptiveLateralIterator {
+                        left_iter: left(from.clone()),
+                        lateral_row: Box::new(move |left_tuple| {
+                            Box::new(ForLoopLeftJoinIterator {
+                                right_evaluator: Rc::clone(&right),
+                                left_iter: Box::new(once(Ok(left_tuple))),
+                                current_right: Box::new(empty()),
+                                left_tuple_to_yield: None,
+                                cancellation_token: row_cancellation_token.clone(),
+                            })
+                        }),
+                        hash_join: Some(Box::new(move |left_iter| {
+                            let mut right_values = InternalTupleSet::new(keys.to_vec());
+                            if let Err(error) = right_values.extend(cancellable(
+                                hash_right(hash_from),
+                                &hash_cancellation_token,
+                            )) {
+                                return Box::new(once(Err(error)));
+                            }
+                            Box::new(HashLeftJoinIterator {
+                                left_iter,
+                                right: right_values,
+                                buffered_results: Vec::new(),
+                                expression,
+                            })
+                        })),
+                        remaining_lateral_rows: max_lateral_rows,
+                        current: Box::new(empty()),
+                        is_hash_join: false,
+                        cancellation_token: cancellation_token.clone(),
+                    })
+                }));
             }
         }
+
+        let (right, right_stats) = self.query_expression_evaluator(right, encoded_variables);
+        stat_children.push(right_stats);
+        let right = right?;
+        let (hash_right, hash_right_stats) =
+            self.query_expression_evaluator(hash_right, encoded_variables);
+        stat_children.push(hash_right_stats);
+        let hash_right = hash_right?;
+        let keys = keys
+            .iter()
+            .map(|v| encode_variable(encoded_variables, v))
+            .collect::<Rc<[_]>>();
+        Ok(Rc::new(move |from| {
+            let right = Rc::clone(&right);
+            let hash_right = Rc::clone(&hash_right);
+            let keys = Rc::clone(&keys);
+            let hash_cancellation_token = cancellation_token.clone();
+            let hash_from = from.clone();
+            Box::new(AdaptiveLateralIterator {
+                left_iter: left(from.clone()),
+                lateral_row: Box::new(move |left_tuple| right(left_tuple)),
+                hash_join: Some(Box::new(move |left_iter| {
+                    let mut built_values = InternalTupleSet::new(keys.to_vec());
+                    if let Err(error) = built_values
+                        .extend(cancellable(hash_right(hash_from), &hash_cancellation_token))
+                    {
+                        return Box::new(once(Err(error)));
+                    }
+                    Box::new(HashJoinIterator {
+                        probe_iter: left_iter.peekable(),
+                        built: built_values,
+                        buffered_results: Vec::new(),
+                    })
+                })),
+                remaining_lateral_rows: max_lateral_rows,
+                current: Box::new(empty()),
+                is_hash_join: false,
+                cancellation_token: cancellation_token.clone(),
+            })
+        }))
     }
 
     #[cfg(feature = "sep-0006")]
@@ -1254,12 +1418,14 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     self.query_expression_evaluator(&right, encoded_variables);
                 stat_children.push(right_stats);
                 let right = right?;
+                let cancellation_token = self.dataset.cancellation_token.clone();
                 return Ok(Rc::new(move |from| {
                     Box::new(ForLoopLeftJoinIterator {
                         right_evaluator: Rc::clone(&right),
                         left_iter: left(from.clone()),
                         current_right: Box::new(empty()),
                         left_tuple_to_yield: None,
+                        cancellation_token: cancellation_token.clone(),
                     })
                 }));
             }
@@ -1267,12 +1433,22 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         let (right, right_stats) = self.query_expression_evaluator(right, encoded_variables);
         stat_children.push(right_stats);
         let right = right?;
+        let cancellation_token = self.dataset.cancellation_token.clone();
         Ok(Rc::new(move |from| {
             let right = Rc::clone(&right);
-            Box::new(left(from.clone()).flat_map(move |t| match t {
-                Ok(t) => right(t),
-                Err(e) => Box::new(once(Err(e))),
-            }))
+            let cancellation_token = cancellation_token.clone();
+            Box::new(left(from.clone()).flat_map(
+                move |t| -> InternalTuplesIterator<'a, D::InternalTerm> {
+                    // The right side might not read anything from the dataset, so we check the cancellation here
+                    if let Err(e) = cancellation_token.ensure_alive() {
+                        return Box::new(once(Err(e)));
+                    }
+                    match t {
+                        Ok(t) => right(t),
+                        Err(e) => Box::new(once(Err(e))),
+                    }
+                },
+            ))
         }))
     }
 
@@ -1509,8 +1685,9 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 })
             })
             .collect::<Result<(Vec<_>, Vec<_>), QueryEvaluationError>>()?;
+        let cancellation_token = self.dataset.cancellation_token.clone();
         Ok(Rc::new(move |from| {
-            let mut tuples_and_sort_keys = match child(from)
+            let mut tuples_and_sort_keys = match cancellable(child(from), &cancellation_token)
                 .map(|tuple| {
                     let tuple = tuple?;
                     let sort_terms = expressions
@@ -1678,6 +1855,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
             .map(|(variable, _)| encode_variable(encoded_variables, variable))
             .collect::<Vec<_>>();
         let dataset = self.dataset.clone();
+        let cancellation_token = self.dataset.cancellation_token.clone();
         Ok(Rc::new(move |from| {
             let tuple_size = from.capacity();
             let key_variables = Rc::clone(&key_variables);
@@ -1692,7 +1870,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     accumulator_builders.iter().map(|c| c()).collect::<Vec<_>>(),
                 );
             }
-            for result in child(from) {
+            for result in cancellable(child(from), &cancellation_token) {
                 let tuple = match result {
                     Ok(tuple) => tuple,
                     Err(error) => return Box::new(once(Err(error))),
@@ -3221,6 +3399,7 @@ struct CartesianProductJoinIterator<'a, T> {
     probe_tuple: Option<InternalTuple<T>>,
     built: Vec<InternalTuple<T>>,
     built_offset: usize,
+    cancellation_token: CancellationToken,
 }
 
 impl<T: Clone + Eq> Iterator for CartesianProductJoinIterator<'_, T> {
@@ -3235,6 +3414,9 @@ impl<T: Clone + Eq> Iterator for CartesianProductJoinIterator<'_, T> {
                 if let Some(result_tuple) = probe_tuple.combine_with(built_tuple) {
                     return Some(Ok(result_tuple));
                 }
+            }
+            if let Err(e) = self.cancellation_token.ensure_alive() {
+                return Some(Err(e));
             }
             self.probe_tuple = match self.probe_iter.next()? {
                 Ok(probe_tuple) => Some(probe_tuple),
@@ -3346,6 +3528,7 @@ struct ForLoopLeftJoinIterator<'a, T> {
     left_iter: InternalTuplesIterator<'a, T>,
     current_right: InternalTuplesIterator<'a, T>,
     left_tuple_to_yield: Option<InternalTuple<T>>,
+    cancellation_token: CancellationToken,
 }
 
 #[cfg(feature = "sep-0006")]
@@ -3364,12 +3547,71 @@ impl<T: Clone> Iterator for ForLoopLeftJoinIterator<'_, T> {
             if let Some(left_tuple) = self.left_tuple_to_yield.take() {
                 return Some(Ok(left_tuple));
             }
+            // The right side might not read anything from the dataset, so we check the cancellation here
+            if let Err(e) = self.cancellation_token.ensure_alive() {
+                return Some(Err(e));
+            }
             let left_tuple = match self.left_iter.next()? {
                 Ok(left_tuple) => left_tuple,
                 Err(error) => return Some(Err(error)),
             };
             self.current_right = (self.right_evaluator)(left_tuple.clone());
             self.left_tuple_to_yield = Some(left_tuple);
+        }
+    }
+}
+
+#[cfg(feature = "sep-0006")]
+type LateralRowEvaluator<'a, T> =
+    Box<dyn Fn(InternalTuple<T>) -> InternalTuplesIterator<'a, T> + 'a>;
+#[cfg(feature = "sep-0006")]
+type HashJoinBuilder<'a, T> =
+    Box<dyn FnOnce(InternalTuplesIterator<'a, T>) -> InternalTuplesIterator<'a, T> + 'a>;
+
+/// Join that evaluates `lateral_row` for each left tuple until `remaining_lateral_rows` is 0
+/// and then uses `hash_join` for the remaining left tuples
+#[cfg(feature = "sep-0006")]
+struct AdaptiveLateralIterator<'a, T> {
+    left_iter: InternalTuplesIterator<'a, T>,
+    lateral_row: LateralRowEvaluator<'a, T>,
+    hash_join: Option<HashJoinBuilder<'a, T>>,
+    remaining_lateral_rows: u64,
+    current: InternalTuplesIterator<'a, T>,
+    is_hash_join: bool,
+    cancellation_token: CancellationToken,
+}
+
+#[cfg(feature = "sep-0006")]
+impl<'a, T: 'a> Iterator for AdaptiveLateralIterator<'a, T> {
+    type Item = Result<InternalTuple<T>, QueryEvaluationError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(tuple) = self.current.next() {
+                return Some(tuple);
+            }
+            if self.is_hash_join {
+                // The hash join has consumed all the left tuples
+                return None;
+            }
+            // The right side might not read anything from the dataset, so we check the cancellation here
+            if let Err(e) = self.cancellation_token.ensure_alive() {
+                return Some(Err(e));
+            }
+            let left_tuple = match self.left_iter.next()? {
+                Ok(left_tuple) => left_tuple,
+                Err(error) => return Some(Err(error)),
+            };
+            if self.remaining_lateral_rows == 0 {
+                // There are too many left tuples, we switch to a hash join for the remaining ones
+                let left_iter = replace(&mut self.left_iter, Box::new(empty()));
+                let hash_join = self.hash_join.take()?;
+                self.current = hash_join(Box::new(once(Ok(left_tuple)).chain(left_iter)));
+                self.is_hash_join = true;
+            } else {
+                self.remaining_lateral_rows -= 1;
+                self.current = (self.lateral_row)(left_tuple);
+            }
         }
     }
 }
@@ -3884,6 +4126,20 @@ impl<T: Hash> InternalTupleSet<T> {
     }
 }
 
+/// Makes the iteration fail if the cancellation token is cancelled
+///
+/// Useful when materializing results that do not come directly from the dataset
+fn cancellable<'a, T: 'a>(
+    iter: InternalTuplesIterator<'a, T>,
+    cancellation_token: &CancellationToken,
+) -> impl Iterator<Item = Result<InternalTuple<T>, QueryEvaluationError>> + 'a {
+    let cancellation_token = cancellation_token.clone();
+    iter.map(move |tuple| {
+        cancellation_token.ensure_alive()?;
+        tuple
+    })
+}
+
 struct StatsIterator<'a, T> {
     inner: InternalTuplesIterator<'a, T>,
     stats: Rc<EvalNodeWithStats>,
@@ -4007,6 +4263,10 @@ fn eval_node_label(node: &QueryExpression) -> String {
                 "Join(HashBuildLeftProbeRight, keys = {})",
                 format_list(keys)
             ),
+            JoinAlgorithm::HashBuildRightProbeLeft { keys } => format!(
+                "Join(HashBuildRightProbeLeft, keys = {})",
+                format_list(keys)
+            ),
         },
         #[cfg(feature = "sep-0006")]
         QueryExpression::Lateral { right, .. } => {
@@ -4025,6 +4285,32 @@ fn eval_node_label(node: &QueryExpression) -> String {
                 }
             }
             "Lateral".to_owned()
+        }
+        #[cfg(feature = "sep-0006")]
+        QueryExpression::AdaptiveLateral {
+            right,
+            keys,
+            max_lateral_rows,
+            ..
+        } => {
+            if let QueryExpression::LeftJoin {
+                left: nested_left,
+                expression,
+                ..
+            } = right.as_ref()
+            {
+                if nested_left.is_empty_singleton() {
+                    return format!(
+                        "ForLoopLeftJoin(expression = {}, hash join on {} after {max_lateral_rows} rows)",
+                        FormattableExpression(expression),
+                        format_list(keys)
+                    );
+                }
+            }
+            format!(
+                "Lateral(hash join on {} after {max_lateral_rows} rows)",
+                format_list(keys)
+            )
         }
         QueryExpression::LeftJoin {
             algorithm,
